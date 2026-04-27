@@ -115,6 +115,13 @@ def _mutate_batch(callback) -> None:
     st.rerun()
 
 
+def _create_activity_and_select(payload: ActivityPayload) -> None:
+    with db_cursor() as connection:
+        state = create_activity(connection, payload)
+    st.session_state.activity_id = state["activity"]["id"]
+    st.rerun()
+
+
 def _reference_options(reference: dict[str, Any], field: dict[str, Any], values: dict[str, Any], activity: dict[str, Any]) -> list[str]:
     locations = reference.get("locations", {})
     reference_key = field.get("reference_key")
@@ -282,19 +289,19 @@ def _render_subcomponents(state: dict[str, Any], key_prefix: str) -> dict[str, A
     sub_components = state.get("sub_components", [])
     st.subheader("Tahapan kegiatan")
 
+    with st.expander("Tambah tahapan", expanded=not sub_components):
+        name = st.text_input("Nama tahapan baru", value="Tahapan Baru", key=f"{key_prefix}-new-sub-name")
+        notes = st.text_area("Catatan", value="Tambahkan tujuan atau catatan singkat tahapan ini.", key=f"{key_prefix}-new-sub-notes")
+        if st.button("Tambah tahapan", type="primary", key=f"{key_prefix}-add-sub"):
+            _mutate(create_sub_component, state["activity"]["id"], SubComponentPayload(name=name, notes=notes))
+
     if not sub_components:
-        st.info("Tambahkan tahapan kegiatan terlebih dahulu.")
+        st.info("Tambahkan tahapan pertama agar bisa lanjut memilih bentuk kegiatan.")
         return None
 
     labels = {f"{item['code']}. {item['name']} - {_rupiah(item.get('sub_total'))}": item for item in sub_components}
     selected_label = st.selectbox("Sub komponen aktif", list(labels), key=f"{key_prefix}-active-sub-component")
     selected = labels[selected_label]
-
-    with st.expander("Tambah tahapan"):
-        name = st.text_input("Nama tahapan baru", value="Tahapan Baru", key=f"{key_prefix}-new-sub-name")
-        notes = st.text_area("Catatan", value="Tambahkan tujuan atau catatan singkat tahapan ini.", key=f"{key_prefix}-new-sub-notes")
-        if st.button("Tambah tahapan", type="primary", key=f"{key_prefix}-add-sub"):
-            _mutate(create_sub_component, state["activity"]["id"], SubComponentPayload(name=name, notes=notes))
 
     with st.expander("Edit tahapan aktif"):
         name = st.text_input("Nama tahapan", value=selected["name"], key=f"{key_prefix}-sub-name-{selected['id']}")
@@ -494,7 +501,7 @@ def main() -> None:
         with st.expander("Buat kegiatan"):
             payload = _activity_form(state["reference"], key_prefix="create-activity")
             if st.button("Buat kegiatan", type="primary", key="create-activity-button"):
-                _mutate(create_activity, payload)
+                _create_activity_and_select(payload)
 
     with tabs[1]:
         selected_sub = _render_subcomponents(state, key_prefix="forms-tab")
