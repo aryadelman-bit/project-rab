@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hmac
 import os
+import sqlite3
+import tempfile
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from app.config import DB_PATH
 from app.database import bootstrap_schema, db_cursor
 from app.schemas import (
     ActivityPayload,
@@ -16,6 +19,7 @@ from app.schemas import (
     ManualAccountPayload,
     SubComponentPayload,
 )
+from app.services.cloud_backup import GitHubBackupConfig, download_database, upload_database
 from app.services.exports import build_excel_export, build_pdf_export
 from app.services.rab import (
     add_manual_account,
@@ -46,6 +50,7 @@ st.set_page_config(
 
 
 def _bootstrap() -> None:
+    _restore_cloud_backup_on_startup()
     bootstrap_schema()
     with db_cursor() as connection:
         bootstrap_application_data(connection)
@@ -58,13 +63,76 @@ def _boot_once() -> bool:
 
 
 def _app_password() -> str | None:
+    return _secret("APP_PASSWORD") or os.getenv("STREAMLIT_APP_PASSWORD")
+
+
+def _secret(name: str) -> str | None:
     try:
-        value = st.secrets.get("APP_PASSWORD")
+        value = st.secrets.get(name)
         if value:
             return str(value)
     except Exception:
         pass
-    return os.getenv("STREAMLIT_APP_PASSWORD")
+    return None
+
+
+def _backup_config() -> GitHubBackupConfig | None:
+    token = _secret("RAB_BACKUP_TOKEN") or os.getenv("RAB_BACKUP_TOKEN")
+    repo = _secret("RAB_BACKUP_REPO") or os.getenv("RAB_BACKUP_REPO")
+    if not token or not repo:
+        return None
+    return GitHubBackupConfig(
+        token=token,
+        repo=repo,
+        branch=_secret("RAB_BACKUP_BRANCH") or os.getenv("RAB_BACKUP_BRANCH") or "main",
+        path=_secret("RAB_BACKUP_PATH") or os.getenv("RAB_BACKUP_PATH") or "rab-state/rab.db",
+    )
+
+
+def _restore_cloud_backup_on_startup() -> None:
+    config = _backup_config()
+    if not config:
+        return
+
+    try:
+        restored = download_database(config, DB_PATH)
+    except Exception as exc:
+        st.session_state.backup_warning = f"Restore backup cloud gagal: {exc}"
+        return
+
+    if restored:
+        st.session_state.backup_status = "Backup cloud berhasil dipulihkan saat app start."
+
+
+def _sync_cloud_backup(reason: str) -> None:
+    config = _backup_config()
+    if not config:
+        return
+
+    try:
+        upload_database(config, DB_PATH, reason)
+        st.session_state.backup_status = "Autosave cloud berhasil."
+        st.session_state.pop("backup_warning", None)
+    except Exception as exc:
+        st.session_state.backup_warning = f"Autosave cloud gagal: {exc}"
+
+
+def _validate_sqlite_bytes(data: bytes) -> None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as temporary_file:
+        temporary_file.write(data)
+        temporary_name = temporary_file.name
+
+    try:
+        connection = sqlite3.connect(temporary_name)
+        try:
+            connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+        finally:
+            connection.close()
+    finally:
+        try:
+            os.remove(temporary_name)
+        except OSError:
+            pass
 
 
 def _password_gate() -> None:
@@ -106,18 +174,21 @@ def _load_activity(activity_id: str) -> dict[str, Any]:
 def _mutate(callback, *args, **kwargs) -> None:
     with db_cursor() as connection:
         callback(connection, *args, **kwargs)
+    _sync_cloud_backup("Autosave RAB database")
     st.rerun()
 
 
 def _mutate_batch(callback) -> None:
     with db_cursor() as connection:
         callback(connection)
+    _sync_cloud_backup("Autosave RAB database")
     st.rerun()
 
 
 def _create_activity_and_select(payload: ActivityPayload) -> None:
     with db_cursor() as connection:
         state = create_activity(connection, payload)
+    _sync_cloud_backup("Autosave RAB database")
     st.session_state.activity_id = state["activity"]["id"]
     st.rerun()
 
@@ -252,6 +323,7 @@ def _form_definition(reference: dict[str, Any], form_code: str) -> dict[str, Any
 
 def _render_sidebar(state: dict[str, Any]) -> str | None:
     st.sidebar.title("RAB Workflow")
+    _render_data_safety_tools()
     activities = _load_activities()
     if not activities:
         st.sidebar.info("Belum ada kegiatan.")
@@ -263,6 +335,46 @@ def _render_sidebar(state: dict[str, Any]) -> str | None:
     selected_label = st.sidebar.selectbox("Kegiatan", list(activity_labels), index=_select_index(list(activity_labels), current_label))
     st.session_state.activity_id = activity_labels[selected_label]
     return st.session_state.activity_id
+
+
+def _render_data_safety_tools() -> None:
+    with st.sidebar.expander("Backup data", expanded=False):
+        st.caption("Streamlit Cloud tidak menjamin penyimpanan file lokal. Download backup berkala atau aktifkan autosave cloud.")
+
+        if st.session_state.get("backup_status"):
+            st.success(st.session_state["backup_status"])
+        if st.session_state.get("backup_warning"):
+            st.warning(st.session_state["backup_warning"])
+
+        if DB_PATH.exists():
+            st.download_button(
+                "Download backup database",
+                data=DB_PATH.read_bytes(),
+                file_name="rab-backup.db",
+                mime="application/octet-stream",
+                key="download-db-backup",
+            )
+        else:
+            st.info("Database lokal belum tersedia.")
+
+        uploaded = st.file_uploader("Restore dari backup .db", type=["db"], key="restore-db-uploader")
+        if uploaded and st.button("Restore backup", key="restore-db-button"):
+            data = uploaded.getvalue()
+            try:
+                _validate_sqlite_bytes(data)
+                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                if DB_PATH.exists():
+                    DB_PATH.replace(DB_PATH.with_suffix(".db.before-restore"))
+                DB_PATH.write_bytes(data)
+                _sync_cloud_backup("Restore RAB database from uploaded backup")
+                st.session_state.backup_status = "Backup berhasil direstore."
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Restore gagal: {exc}")
+
+        if not _backup_config():
+            st.info("Autosave cloud belum aktif. Tambahkan secrets `RAB_BACKUP_TOKEN` dan `RAB_BACKUP_REPO` untuk backup otomatis.")
 
 
 def _render_summary(summary: dict[str, Any]) -> None:
