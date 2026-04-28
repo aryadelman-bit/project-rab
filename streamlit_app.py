@@ -357,6 +357,11 @@ def _render_data_safety_tools() -> None:
         else:
             st.info("Database lokal belum tersedia.")
 
+        if _backup_config():
+            if st.button("Backup sekarang ke cloud", key="backup-now-cloud"):
+                _sync_cloud_backup("Manual RAB database backup")
+                st.rerun()
+
         uploaded = st.file_uploader("Restore dari backup .db", type=["db"], key="restore-db-uploader")
         if uploaded and st.button("Restore backup", key="restore-db-button"):
             data = uploaded.getvalue()
