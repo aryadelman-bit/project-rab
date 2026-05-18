@@ -4,6 +4,6 @@ headless = true
 [theme]
 base = "light"
 primaryColor = "#0E4F5C"
-backgroundColor = "#F7F4EC"
+backgroundColor = "#FBF7EE"
 secondaryBackgroundColor = "#FFFFFF"
-textColor = "#183235"
+textColor = "#172F34"
